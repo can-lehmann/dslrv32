@@ -98,6 +98,7 @@ def infer_op_width(kind, args):
 class Op(Instr):
     def __init__(self, kind, args):
         super().__init__(infer_op_width(kind, [arg.width for arg in args]), args)
+        self.kind = kind
 
 class Slice(Instr):
     def __init__(self, value, offset, width):
@@ -258,6 +259,9 @@ class ValueBuilder:
     def __eq__(self, other):
         return ValueBuilder.op(OpKind.Eq, self, other)
 
+    def __ne__(self, other):
+        return ~(self == other)
+
     def concat(self, other):
         return ValueBuilder.op(OpKind.Concat, self, other)
 
@@ -330,6 +334,69 @@ class ResourceBuilder:
     def predict(self, value, index=None, enable=None):
         index, enable = self.create_index_enable(index, enable)
         self.builder.emit(Predict(self.resource, value.value, index.value, enable.value))
+
+def generate_verilog(processor):
+    ports = ["input clock"]
+    body = ""
+
+    processor.autoname()
+
+    for group in processor.groups:
+        for instr in group.instrs:
+            args = []
+            for arg in instr.args:
+                if isinstance(arg, Instr):
+                    args.append("_" + arg.name)
+                elif isinstance(arg, Const):
+                    args.append(arg.format_arg())
+                else:
+                    assert False
+
+            expr = None
+            match instr:
+                case Read():
+                    expr = f"{instr.resource.name}[{args[0]}]"
+                case Predict(): pass
+                case Write():
+                    body += f"always @(posedge clock) "
+                    body += f"if ({args[2]}) "
+                    body += f"{instr.resource.name}[{args[1]}] <= {args[0]};\n"
+                case Op():
+                    SIMPLE_BINOPS = {
+                        OpKind.Add: "+", OpKind.Sub: "-", OpKind.Mul: "*",
+                        OpKind.Shl: "<<", OpKind.ShrU: ">>", OpKind.ShrS: ">>>",
+                        OpKind.And: "&", OpKind.Or: "|", OpKind.Xor: "^",
+                        OpKind.Eq: "=="
+                    }
+
+                    if instr.kind in SIMPLE_BINOPS:
+                        expr = f"{args[0]} {SIMPLE_BINOPS[instr.kind]} {args[1]}"
+                    elif instr.kind == OpKind.Not:
+                        expr = f"~{args[0]}"
+                    elif instr.kind == OpKind.LtS:
+                        expr = f"$signed({args[0]}) < $signed({args[1]})"
+                    elif instr.kind == OpKind.LtU:
+                        expr = f"$unsigned({args[0]}) < $unsigned({args[1]})"
+                    elif instr.kind == OpKind.Concat:
+                        expr = f"{{{args[0]}, {args[1]}}}"
+                    elif instr.kind == OpKind.Mux:
+                        expr = f"{args[0]} ? {args[1]} : {args[2]}"
+                    else:
+                        print(instr.kind)
+                        assert False
+                case Slice():
+                    expr = f"{args[0]}[{instr.width + instr.offset - 1}:{instr.offset}]"
+                case Repeat():
+                    expr = f"{{{instr.count}{{{args[0]}}}}}"
+                case _:
+                    print(instr.format(0))
+                    assert False
+
+            if expr is not None:
+                body += f"wire [{instr.width - 1}:0] _{instr.name} = {expr};\n"
+
+    ports = ", ".join(ports)
+    return f"module {processor.name}({ports});\n{body}\nendmodule"
 
 if __name__ == "__main__":
     from parse_opcodes import InstEncoding
@@ -432,3 +499,5 @@ if __name__ == "__main__":
         reg_file.write(alu_res, index=rd, enable=alu_valid)
 
     print(processor.format(0))
+
+    print(generate_verilog(processor))
