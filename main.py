@@ -41,13 +41,19 @@ class Instr(Value):
     def format_instr_kind(self):
         return self.__class__.__name__.lower()
 
+    def format_parameters(self):
+        return []
+
     def format(self, indent):
         res = ind(indent)
         if self.width > 0:
             res += f"%{self.name} = "
         res += self.format_instr_kind()
         if len(self.args) > 0:
-            res += " " + ", ".join([arg.format_arg() for arg in self.args])
+            res += " " + ", ".join(
+                [arg.format_arg() for arg in self.args] +
+                self.format_parameters()
+            )
         return res + "\n"
 
 OpKind = Enum("OpKind", [
@@ -111,20 +117,32 @@ class Slice(Instr):
         super().__init__(width, [value])
         self.offset = offset
 
+    def format_parameters(self):
+        return [f"offset={self.offset}", f"width={self.width}"]
+
 class Repeat(Instr):
     def __init__(self, value, count):
         super().__init__(value.width * count, [value])
         self.count = count
+
+    def format_parameters(self):
+        return [f"count={self.count}"]
 
 class Read(Instr):
     def __init__(self, resource, index, enable):
         super().__init__(resource.width, [index, enable])
         self.resource = resource
 
+    def format_parameters(self):
+        return [f"resource={self.resource.name}"]
+
 class BaseWrite(Instr):
     def __init__(self, resource, value, index, enable):
         super().__init__(0, [value, index, enable])
         self.resource = resource
+
+    def format_parameters(self):
+        return [f"resource={self.resource.name}"]
 
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
@@ -148,6 +166,7 @@ class Resource:
     def __init__(self, name, width):
         self.name = name
         self.width = width
+        self.initial = {}
 
 class RegisterResource(Resource):
     def __init__(self, name, width):
@@ -331,6 +350,9 @@ class ResourceBuilder:
         self.builder = builder
         self.resource = resource
 
+    def init(self, value, index=0):
+        self.resource.initial[index] = value
+
     def create_index_enable(self, index, enable):
         if index is None:
             index = self.builder.const(1, 0)
@@ -366,10 +388,14 @@ def generate_verilog(processor):
 
     for resource in processor.resources:
         match resource:
-            case RegisterResource(name=name, width=width):
+            case RegisterResource(name=name, width=width, initial=initial):
                 body += f"reg [{width - 1}:0] {name};\n"
-            case MemoryResource(name=name, width=width, size=size):
+                if 0 in initial:
+                    body += f"initial {name} = {width}'d{initial[0]};\n"
+            case MemoryResource(name=name, width=width, initial=initial, size=size):
                 body += f"reg [{width - 1}:0] {name}[{size}];\n"
+                for index, value in initial.items():
+                    body += f"initial {name}[{index}] = {width}'d{value};\n"
 
     for group in processor.groups:
         for instr in group.instrs:
@@ -397,13 +423,13 @@ def generate_verilog(processor):
                                 expr = name
                 case Predict(): pass
                 case Write(resource=resource):
-                    match instr:
+                    match resource:
                         case RegisterResource(name=name):
                             body += f"always @(posedge clock) "
                             body += f"if ({args[2]}) "
                             body += f"{instr.resource.name} <= {args[0]};\n"
                         case MemoryResource(name=name, width=width, write_delay=write_delay):
-                            assert width == 1
+                            assert write_delay == 1
                             body += f"always @(posedge clock) "
                             body += f"if ({args[2]}) "
                             body += f"{name}[{args[1]}] <= {args[0]};\n"
@@ -446,20 +472,44 @@ def generate_verilog(processor):
 
 if __name__ == "__main__":
     from parse_opcodes import InstEncoding
-    inst_encodings = InstEncoding.load_dir("opcodes")
-    print(inst_encodings)
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.constants import P_FLAGS
 
     processor = Processor("Processor")
     builder = Builder(processor)
 
     pc = builder.resource(RegisterResource("pc", 32))
     reg_file = builder.resource(MemoryResource("reg_file", 32, size=32))
-    inst_mem = builder.resource(MemoryResource("inst_mem", 32, size=1024))
-    data_mem = builder.resource(MemoryResource("data_mem", 32, size=1024))
+    inst_mem = builder.resource(MemoryResource("inst_mem", 32, size = 1 << 24, read_delay = 0))
+    data_mem = builder.resource(MemoryResource("data_mem", 32, size = 1 << 24, read_delay = 0))
+
+    reg_file.init(0, index=0)
+
+    with open("rv32i_test", "rb") as f:
+        elf_file = ELFFile(f)
+        pc.init(elf_file["e_entry"])
+        for segment in elf_file.iter_segments():
+            mem = data_mem
+            if segment["p_flags"] & P_FLAGS.PF_X:
+                mem = inst_mem
+
+            addr = segment["p_vaddr"]
+            data = segment.data()
+            assert segment["p_memsz"] == len(data)
+            for byte in data:
+                index = addr // 4
+                offset = addr % 4
+                if index in mem.resource.initial:
+                    word = mem.resource.initial[index]
+                else:
+                    word = 0
+                word |= int(byte) << (8 * offset)
+                mem.init(word, index = index)
+                addr += 1
 
     with builder.group("fetch"):
         pc_value = pc.read()
-        inst = inst_mem.read(pc_value)
+        inst = inst_mem.read(pc_value.shr_u(2))
 
         pc.predict(pc_value + 4)
 
@@ -470,6 +520,8 @@ if __name__ == "__main__":
         is_imm12 = builder.const(1, 0)
         is_imm12_hi_lo = builder.const(1, 0)
         is_bimm12 = builder.const(1, 0)
+
+        inst_encodings = InstEncoding.load_dir("opcodes")
         for enc in inst_encodings:
             matches = inst & enc.mask == enc.pattern
             is_inst[enc.name] = matches
@@ -542,7 +594,7 @@ if __name__ == "__main__":
         pass #data_mem.read(, enable)
 
     with builder.group("writeback"):
-        reg_file.write(alu_res, index=rd, enable=alu_valid)
+        reg_file.write(alu_res, index = rd, enable = alu_valid & (rd != 0))
 
     print(processor.format(0))
 
