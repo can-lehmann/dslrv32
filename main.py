@@ -38,11 +38,14 @@ class Instr(Value):
         super().__init__(width)
         self.args = args
 
+    def format_instr_kind(self):
+        return self.__class__.__name__.lower()
+
     def format(self, indent):
         res = ind(indent)
         if self.width > 0:
             res += f"%{self.name} = "
-        res += self.__class__.__name__.lower()
+        res += self.format_instr_kind()
         if len(self.args) > 0:
             res += " " + ", ".join([arg.format_arg() for arg in self.args])
         return res + "\n"
@@ -99,6 +102,9 @@ class Op(Instr):
     def __init__(self, kind, args):
         super().__init__(infer_op_width(kind, [arg.width for arg in args]), args)
         self.kind = kind
+
+    def format_instr_kind(self):
+        return self.kind.name.lower()
 
 class Slice(Instr):
     def __init__(self, value, offset, width):
