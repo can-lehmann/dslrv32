@@ -443,7 +443,7 @@ if __name__ == "__main__":
     inst_encodings = InstEncoding.load_dir("opcodes")
     print(inst_encodings)
 
-    processor = Processor("rv32")
+    processor = Processor("Processor")
     builder = Builder(processor)
 
     pc = builder.resource(RegisterResource("pc", 32))
@@ -540,4 +540,5 @@ if __name__ == "__main__":
 
     print(processor.format(0))
 
-    print(generate_verilog(processor))
+    with open(f"{processor.name}.v", "w") as f:
+        f.write(generate_verilog(processor))

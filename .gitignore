@@ -1,2 +1,7 @@
 __pycache__/
-
+*.vvp
+*.fst
+*.o
+Processor.v
+rv32i_*
+!rv32i_*.c
