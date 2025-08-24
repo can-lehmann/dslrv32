@@ -239,6 +239,12 @@ class Builder:
             res = branch[0].mux(branch[1:], res)
         return res
 
+    def concat(self, *args):
+        res = args[0]
+        for value in args[1:]:
+            res = ValueBuilder.op(OpKind.Concat, res, value)
+        return res
+
 class GroupBuilder:
     def __init__(self, builder, group):
         self.builder = builder
@@ -256,6 +262,10 @@ class ValueBuilder:
         assert isinstance(value, Value)
         self.builder = builder
         self.value = value
+
+    def name(self, name):
+        self.value.name = name
+        return self
 
     def op(kind, *args):
         widths = [
@@ -351,6 +361,10 @@ class ResourceBuilder:
         self.resource = resource
 
     def init(self, value, index=0):
+        if isinstance(value, ValueBuilder):
+            value = value.value
+        if isinstance(value, Const):
+            value = value.value
         self.resource.initial[index] = value
 
     def create_index_enable(self, index, enable):
@@ -478,12 +492,17 @@ if __name__ == "__main__":
     processor = Processor("Processor")
     builder = Builder(processor)
 
+    STATE_RUNNING = builder.const(3, 0)
+    STATE_EBREAK = builder.const(3, 1)
+
     pc = builder.resource(RegisterResource("pc", 32))
-    reg_file = builder.resource(MemoryResource("reg_file", 32, size=32))
+    state = builder.resource(RegisterResource("state", 3))
+    reg_file = builder.resource(MemoryResource("reg_file", 32, size = 32, read_delay = 0))
     inst_mem = builder.resource(MemoryResource("inst_mem", 32, size = 1 << 24, read_delay = 0))
     data_mem = builder.resource(MemoryResource("data_mem", 32, size = 1 << 24, read_delay = 0))
 
     reg_file.init(0, index=0)
+    state.init(STATE_RUNNING)
 
     with open("rv32i_test", "rb") as f:
         elf_file = ELFFile(f)
@@ -495,8 +514,11 @@ if __name__ == "__main__":
 
             addr = segment["p_vaddr"]
             data = segment.data()
-            assert segment["p_memsz"] == len(data)
-            for byte in data:
+            for it in range(segment["p_memsz"]):
+                if it < len(data):
+                    byte = int(data[it])
+                else:
+                    byte = 0
                 index = addr // 4
                 offset = addr % 4
                 if index in mem.resource.initial:
@@ -508,8 +530,11 @@ if __name__ == "__main__":
                 addr += 1
 
     with builder.group("fetch"):
+        state_value = state.read()
+        is_running = state_value == STATE_RUNNING
+
         pc_value = pc.read()
-        inst = inst_mem.read(pc_value.shr_u(2))
+        inst = inst_mem.read(pc_value.shr_u(2)).name("inst")
 
         pc.predict(pc_value + 4)
 
@@ -518,12 +543,13 @@ if __name__ == "__main__":
         is_imm20 = builder.const(1, 0)
         is_jimm20 = builder.const(1, 0)
         is_imm12 = builder.const(1, 0)
-        is_imm12_hi_lo = builder.const(1, 0)
         is_bimm12 = builder.const(1, 0)
+        is_simm12 = builder.const(1, 0)
 
         inst_encodings = InstEncoding.load_dir("opcodes")
         for enc in inst_encodings:
             matches = inst & enc.mask == enc.pattern
+            matches.name(f"is_{enc.name}")
             is_inst[enc.name] = matches
             if "imm20" in enc.args:
                 is_imm20 |= matches
@@ -531,25 +557,45 @@ if __name__ == "__main__":
                 is_jimm20 |= matches
             if "imm12" in enc.args:
                 is_imm12 |= matches
+            if "bimm12hi" in enc.args:
+                is_bimm12 |= matches
             if "imm12hi" in enc.args:
-                is_imm12_hi_lo |= matches
+                is_simm12 |= matches
 
         rs1 = inst[15:20]
         rs2 = inst[20:25]
         rd = inst[7:12]
 
-        imm20 = inst[12:32].concat(builder.const(12, 0))
+        imm20 = builder.concat(inst[12:32], builder.const(12, 0))
+        jimm20 = builder.concat(
+            inst[31],
+            inst[12:20],
+            inst[20],
+            inst[25:31],
+            inst[21:25],
+            builder.const(1, 0)
+        ).s_ext(32)
         imm12 = inst[20:32].s_ext(32)
+        bimm12 = builder.concat(
+            inst[31],
+            inst[7],
+            inst[25:31],
+            inst[8:12],
+            builder.const(1, 0)
+        ).s_ext(32)
 
-        has_imm = is_imm20 | is_imm12
+        has_imm = is_imm20 | is_jimm20 | is_imm12 | is_bimm12
         imm, = builder.cond(
-            (is_imm20, imm20),
-            (is_imm12, imm12),
+            (is_imm20,  imm20),
+            (is_jimm20, jimm20),
+            (is_imm12,  imm12),
+            (is_bimm12, bimm12),
             (0,)
         )
+        imm.name("imm")
 
-        r1 = reg_file.read(rs1)
-        r2 = reg_file.read(rs2)
+        r1 = reg_file.read(rs1).name("r1")
+        r2 = reg_file.read(rs2).name("r2")
 
     with builder.group("execute"):
         rhs = has_imm.mux(imm, r2)
@@ -565,36 +611,46 @@ if __name__ == "__main__":
             (is_inst["slt"]  | is_inst["slti"],  1, r1.lt_s(rhs).mux(builder.const(32, 1), 0)),
             (is_inst["sltu"] | is_inst["sltiu"], 1, r1.lt_u(rhs).mux(builder.const(32, 1), 0)),
             (is_inst["jal"],                     1, pc_value + 4),
+            (is_inst["jalr"],                    1, pc_value + 4),
             (is_inst["auipc"],                   1, pc_value + imm),
             (is_inst["lui"],                     1, imm),
             (builder.const(1, 0), 0)
         )
 
         branch_target, = builder.cond(
-            (is_inst["jalr"], r1),
+            (is_inst["jalr"], r1 + imm),
+            (is_inst["ebreak"], pc_value),
             (pc_value + imm,)
         )
 
         branch, = builder.cond(
-            (is_inst["jal"],   1),
-            (is_inst["jalr"],  1),
-            (is_inst["beq"],   r1 == r2),
-            (is_inst["bne"],   r1 != r2),
-            (is_inst["blt"],   r1.lt_s(r2)),
-            (is_inst["bge"],   ~r1.lt_s(r2)),
-            (is_inst["bltu"],  r1.lt_u(r2)),
-            (is_inst["bgeu"],  ~r1.lt_u(r2)),
+            (is_inst["jal"],    1),
+            (is_inst["jalr"],   1),
+            (is_inst["ebreak"], 1),
+            (is_inst["beq"],    r1 == r2),
+            (is_inst["bne"],    r1 != r2),
+            (is_inst["blt"],    r1.lt_s(r2)),
+            (is_inst["bge"],    ~r1.lt_s(r2)),
+            (is_inst["bltu"],   r1.lt_u(r2)),
+            (is_inst["bgeu"],   ~r1.lt_u(r2)),
             (0,)
         )
 
+        next_state, = builder.cond(
+            (is_running & is_inst["ebreak"], STATE_EBREAK),
+            (state_value,)
+        )
+
         next_pc = branch.mux(branch_target, pc_value + 4)
-        pc.write(next_pc)
+        pc.write(next_pc, enable = is_running)
 
     with builder.group("memory"):
         pass #data_mem.read(, enable)
 
     with builder.group("writeback"):
-        reg_file.write(alu_res, index = rd, enable = alu_valid & (rd != 0))
+        reg_file.write(alu_res, index = rd, enable = is_running & alu_valid & (rd != 0))
+
+        state.write(next_state)
 
     print(processor.format(0))
 
