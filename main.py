@@ -143,6 +143,17 @@ class Resource:
         self.name = name
         self.width = width
 
+class RegisterResource(Resource):
+    def __init__(self, name, width):
+        super().__init__(name, width)
+
+class MemoryResource(Resource):
+    def __init__(self, name, width, size, read_delay=1, write_delay=1):
+        super().__init__(name, width)
+        self.size = size
+        self.read_delay = read_delay
+        self.write_delay = write_delay
+
 class Processor:
     def __init__(self, name):
         self.name = name
@@ -341,6 +352,19 @@ def generate_verilog(processor):
 
     processor.autoname()
 
+    gen_sym_id = 0
+    def gen_sym():
+        nonlocal gen_sym_id
+        gen_sym_id += 1
+        return f"t{gen_sym_id}"
+
+    for resource in processor.resources:
+        match resource:
+            case RegisterResource(name=name, width=width):
+                body += f"reg [{width - 1}:0] {name};\n"
+            case MemoryResource(name=name, width=width, size=size):
+                body += f"reg [{width - 1}:0] {name}[{size}];\n"
+
     for group in processor.groups:
         for instr in group.instrs:
             args = []
@@ -354,14 +378,30 @@ def generate_verilog(processor):
 
             expr = None
             match instr:
-                case Read():
-                    expr = f"{instr.resource.name}[{args[0]}]"
+                case Read(resource=resource):
+                    match resource:
+                        case RegisterResource(name=name):
+                            expr = name
+                        case MemoryResource(name=name, width=width, read_delay=read_delay):
+                            expr = f"{name}[{args[0]}]"
+                            for it in range(read_delay):
+                                name = gen_sym()
+                                body += f"reg [{width - 1}:0] {name};\n"
+                                body += f"always @(posedge clock) {name} <= {expr};\n"
+                                expr = name
                 case Predict(): pass
-                case Write():
-                    body += f"always @(posedge clock) "
-                    body += f"if ({args[2]}) "
-                    body += f"{instr.resource.name}[{args[1]}] <= {args[0]};\n"
-                case Op():
+                case Write(resource=resource):
+                    match instr:
+                        case RegisterResource(name=name):
+                            body += f"always @(posedge clock) "
+                            body += f"if ({args[2]}) "
+                            body += f"{instr.resource.name} <= {args[0]};\n"
+                        case MemoryResource(name=name, width=width, write_delay=write_delay):
+                            assert width == 1
+                            body += f"always @(posedge clock) "
+                            body += f"if ({args[2]}) "
+                            body += f"{name}[{args[1]}] <= {args[0]};\n"
+                case Op(kind=kind):
                     SIMPLE_BINOPS = {
                         OpKind.Add: "+", OpKind.Sub: "-", OpKind.Mul: "*",
                         OpKind.Shl: "<<", OpKind.ShrU: ">>", OpKind.ShrS: ">>>",
@@ -369,25 +409,25 @@ def generate_verilog(processor):
                         OpKind.Eq: "=="
                     }
 
-                    if instr.kind in SIMPLE_BINOPS:
-                        expr = f"{args[0]} {SIMPLE_BINOPS[instr.kind]} {args[1]}"
-                    elif instr.kind == OpKind.Not:
+                    if kind in SIMPLE_BINOPS:
+                        expr = f"{args[0]} {SIMPLE_BINOPS[kind]} {args[1]}"
+                    elif kind == OpKind.Not:
                         expr = f"~{args[0]}"
-                    elif instr.kind == OpKind.LtS:
+                    elif kind == OpKind.LtS:
                         expr = f"$signed({args[0]}) < $signed({args[1]})"
-                    elif instr.kind == OpKind.LtU:
+                    elif kind == OpKind.LtU:
                         expr = f"$unsigned({args[0]}) < $unsigned({args[1]})"
-                    elif instr.kind == OpKind.Concat:
+                    elif kind == OpKind.Concat:
                         expr = f"{{{args[0]}, {args[1]}}}"
-                    elif instr.kind == OpKind.Mux:
+                    elif kind == OpKind.Mux:
                         expr = f"{args[0]} ? {args[1]} : {args[2]}"
                     else:
-                        print(instr.kind)
+                        print(kind)
                         assert False
-                case Slice():
-                    expr = f"{args[0]}[{instr.width + instr.offset - 1}:{instr.offset}]"
-                case Repeat():
-                    expr = f"{{{instr.count}{{{args[0]}}}}}"
+                case Slice(width=width, offset=offset):
+                    expr = f"{args[0]}[{width + offset - 1}:{offset}]"
+                case Repeat(count=count):
+                    expr = f"{{{count}{{{args[0]}}}}}"
                 case _:
                     print(instr.format(0))
                     assert False
@@ -406,10 +446,10 @@ if __name__ == "__main__":
     processor = Processor("rv32")
     builder = Builder(processor)
 
-    pc = builder.resource(Resource("pc", 32))
-    reg_file = builder.resource(Resource("reg_file", 32))
-    inst_mem = builder.resource(Resource("inst_mem", 32))
-    data_mem = builder.resource(Resource("data_mem", 32))
+    pc = builder.resource(RegisterResource("pc", 32))
+    reg_file = builder.resource(MemoryResource("reg_file", 32, size=32))
+    inst_mem = builder.resource(MemoryResource("inst_mem", 32, size=1024))
+    data_mem = builder.resource(MemoryResource("data_mem", 32, size=1024))
 
     with builder.group("fetch"):
         pc_value = pc.read()
