@@ -347,6 +347,12 @@ class ValueBuilder:
             return ValueBuilder(self.builder, self.value)
         return self[self.value.width - 1].repeat(width - self.value.width).concat(self)
 
+    def z_ext(self, width):
+        assert self.value.width <= width
+        if self.value.width == width:
+            return ValueBuilder(self.builder, self.value)
+        return self.builder.const(width - self.value.width, 0).concat(self)
+
     def mux(self, true_value, false_value):
         if isinstance(true_value, tuple):
             assert isinstance(false_value, tuple)
@@ -498,8 +504,8 @@ if __name__ == "__main__":
     pc = builder.resource(RegisterResource("pc", 32))
     state = builder.resource(RegisterResource("state", 3))
     reg_file = builder.resource(MemoryResource("reg_file", 32, size = 32, read_delay = 0))
-    inst_mem = builder.resource(MemoryResource("inst_mem", 32, size = 1 << 24, read_delay = 0))
-    data_mem = builder.resource(MemoryResource("data_mem", 32, size = 1 << 24, read_delay = 0))
+    inst_mem = builder.resource(MemoryResource("inst_mem", 8, size = 1 << 24, read_delay = 0))
+    data_mem = builder.resource(MemoryResource("data_mem", 8, size = 1 << 24, read_delay = 0))
 
     reg_file.init(0, index=0)
     state.init(STATE_RUNNING)
@@ -519,14 +525,7 @@ if __name__ == "__main__":
                     byte = int(data[it])
                 else:
                     byte = 0
-                index = addr // 4
-                offset = addr % 4
-                if index in mem.resource.initial:
-                    word = mem.resource.initial[index]
-                else:
-                    word = 0
-                word |= int(byte) << (8 * offset)
-                mem.init(word, index = index)
+                mem.init(byte, index = addr)
                 addr += 1
 
     with builder.group("fetch"):
@@ -534,7 +533,12 @@ if __name__ == "__main__":
         is_running = state_value == STATE_RUNNING
 
         pc_value = pc.read()
-        inst = inst_mem.read(pc_value.shr_u(2)).name("inst")
+        inst = builder.concat(
+            inst_mem.read(pc_value + 3),
+            inst_mem.read(pc_value + 2),
+            inst_mem.read(pc_value + 1),
+            inst_mem.read(pc_value + 0)
+        ).name("inst")
 
         pc.predict(pc_value + 4)
 
@@ -616,6 +620,8 @@ if __name__ == "__main__":
             (is_inst["lui"],                     1, imm),
             (builder.const(1, 0), 0)
         )
+        alu_valid.name("alu_valid")
+        alu_res.name("alu_res")
 
         branch_target, = builder.cond(
             (is_inst["jalr"], r1 + imm),
@@ -640,15 +646,58 @@ if __name__ == "__main__":
             (is_running & is_inst["ebreak"], STATE_EBREAK),
             (state_value,)
         )
+        next_state.name("next_state")
 
         next_pc = branch.mux(branch_target, pc_value + 4)
         pc.write(next_pc, enable = is_running)
 
     with builder.group("memory"):
-        pass #data_mem.read(, enable)
+        addr = r1 + imm
+
+        # For now we just assume that we have unlimited read/write ports, this is
+        # not a problem which I am interested in solving right now.
+        mem_valid, mem_res = builder.cond(
+            (is_inst["lb"],  1, data_mem.read(addr).s_ext(32)),
+            (is_inst["lh"],  1, builder.concat(
+                data_mem.read(addr + 1),
+                data_mem.read(addr + 0)
+            ).s_ext(32)),
+            (is_inst["lw"],  1, builder.concat(
+                data_mem.read(addr + 3),
+                data_mem.read(addr + 2),
+                data_mem.read(addr + 1),
+                data_mem.read(addr + 0)
+            )),
+            (is_inst["lbu"], 1, data_mem.read(addr).z_ext(32)),
+            (is_inst["lh"],  1, builder.concat(
+                data_mem.read(addr + 1),
+                data_mem.read(addr + 0)
+            ).z_ext(32)),
+            (builder.const(1, 0), 0)
+        )
+        mem_valid.name("mem_valid")
+        mem_res.name("mem_res")
+
+        write_mask, = builder.cond(
+            (is_inst["sb"], 1),
+            (is_inst["sh"], 3),
+            (is_inst["sw"], 15),
+            (builder.const(4, 0),)
+        )
+        write_mask.name("write_mask")
+
+        data_mem.write(r2[24:32], index = addr, enable = is_running & write_mask[3])
+        data_mem.write(r2[16:24], index = addr, enable = is_running & write_mask[2])
+        data_mem.write(r2[8:16], index = addr, enable = is_running & write_mask[1])
+        data_mem.write(r2[0:8], index = addr, enable = is_running & write_mask[0])
 
     with builder.group("writeback"):
-        reg_file.write(alu_res, index = rd, enable = is_running & alu_valid & (rd != 0))
+        rd_valid, rd_res = builder.cond(
+            (alu_valid, 1, alu_res),
+            (mem_valid, 1, mem_res),
+            (builder.const(1, 0), 0)
+        )
+        reg_file.write(rd_res, index = rd, enable = is_running & rd_valid & (rd != 0))
 
         state.write(next_state)
 
