@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from enum import Enum
 
 def ind(indent, width = 2):
@@ -155,6 +156,12 @@ class Read(Instr):
     def format_parameters(self):
         return [f"resource={self.resource.name}"]
 
+    def get_index(self):
+        return self.args[0]
+
+    def get_enable(self):
+        return self.args[1]
+
 class BaseWrite(Instr):
     def __init__(self, resource, value, index=None, enable=None):
         if index is None:
@@ -172,6 +179,9 @@ class BaseWrite(Instr):
 
     def set_enable(self, enable):
         self.args[2] = enable
+
+    def get_index(self):
+        return self.args[1]
 
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
@@ -211,6 +221,9 @@ class Group:
     def add(self, instr):
         self.instrs.append(instr)
         return instr
+
+    def add_all(self, *instrs):
+        self.instrs += instrs
 
     def format(self, indent):
         res = ind(indent) + f"{self.name}:\n"
@@ -649,9 +662,61 @@ def build_stall_tree(terminator, stall):
         case AlwaysTerminator(group=group):
             return stall[group]
 
+def create_id(processor):
+    """Each execution is given an identifier for the purpose of ordering."""
+    id_reg = processor.add_resource(RegisterResource(
+        "id_reg",
+        math.ceil(math.log2(len(processor.groups))) * 2, # *2 just to be safe.
+        initial = 0
+    ))
+    id = Read(id_reg)
+    id.name = "id"
+    next_id = Op(OpKind.Add, [id, Const(id.width, 1)])
+    processor.groups[0].add_all(id, next_id, Write(id_reg, next_id))
+
+    return id
+
+class Access:
+    def __init__(self, is_write, resource, index, enable):
+        self.is_write = is_write
+        self.resource = resource
+        self.index = index
+        self.enable = enable
+
+    def from_instr(instr):
+        if isinstance(instr, Read) or isinstance(instr, Write):
+            return Access(
+                isinstance(instr, Write),
+                instr.resource,
+                instr.get_index(),
+                instr.get_enable()
+            )
+        return None
+
+def find_accesses(processor):
+    accesses = {}
+    for group in processor.groups[::-1]:
+        accesses[group] = {}
+        for next in group.terminator.collect_groups():
+            for instr, access in accesses[next].items():
+                if instr not in accesses[group]:
+                    accesses[group][instr] = access
+        for instr in group.instrs:
+            access = Access.from_instr(instr)
+            if access is not None:
+                accesses[group][instr] = access
+    return accesses
+
 def lower_pipeline(processor):
     lifetimes = analyze_lifetimes(processor)
     dominators = find_dominators(processor)
+    accesses = find_accesses(processor)
+    id = create_id(processor)
+    for group, live in lifetimes.items():
+        # We need to ID to be live everywhere
+        if group != processor.groups[0]:
+            live.add(id)
+
     regs = {
         group: {
             instr: processor.add_resource(RegisterResource(
@@ -686,6 +751,75 @@ def lower_pipeline(processor):
             if instr.width == 0:
                 side_effects.add(instr)
 
+    def value_in_group(value, group):
+        if isinstance(value, Const):
+            return value
+        elif value in regs[group]:
+            return Read(regs[group][value])
+        elif isinstance(value, Op) and value.width == 1:
+            args = []
+            for arg in value.args:
+                arg = value_in_group(arg, group)
+                if arg is None:
+                    return None
+                args.append(arg)
+            return Op(value.kind, args)
+        return None
+
+    def access_in_group(access, group):
+        return Access(
+            access.is_write,
+            access.resource,
+            value_in_group(access.index, group),
+            value_in_group(access.enable, group)
+        )
+
+    for group in processor.groups:
+        for other in processor.groups:
+            if group == other:
+                continue
+            # can_conflict := group.valid & other.valid & other.id <_commit group.id
+            # So: not(can_conflict)
+            #     <- other.id >=_commit group.id
+            #     <- other dominates group
+            if other in dominators[group]:
+                continue
+            can_conflict = Op(OpKind.And, [
+                Read(valid[group]),
+                Read(valid[other])
+            ])
+            # If group dominates other -> other.id <_commit group.id
+            if group not in dominators[other]:
+                assert False # Not implemented
+            any_conflict = Const(1, 0)
+            for other_instr, other_access in accesses[other].items():
+                for instr in group.instrs:
+                    access = Access.from_instr(instr)
+                    if access is not None and \
+                       (access.is_write or other_access.is_write) and \
+                       access.resource == other_access.resource:
+                        other_access_known = access_in_group(other_access, other)
+                        conflict = access.enable
+                        if other_access_known.enable is not None:
+                            conflict = Op(OpKind.And, [
+                                conflict,
+                                other_access_known.enable
+                            ])
+                        if other_access_known.index is not None:
+                            conflict = Op(OpKind.And, [
+                                conflict,
+                                Op(OpKind.Eq, [
+                                    other_access_known.index,
+                                    access.index
+                                ])
+                            ])
+                        any_conflict = Op(OpKind.Or, [any_conflict, conflict])
+            conflict = Op(OpKind.And, [can_conflict, any_conflict])
+            stall[group].set(Op(OpKind.Or, [
+                conflict,
+                stall[group].get()
+            ]))
+
     for group in processor.groups:
         substs = {instr: Read(resource) for instr, resource in regs[group].items()}
         for instr in group.instrs:
@@ -693,7 +827,7 @@ def lower_pipeline(processor):
         for next in group.terminator.collect_groups(): # TODO
             side_effects.add(Write(
                 valid[next],
-                Read(valid[group]),
+                Op(OpKind.And, [Read(valid[group]), Op(OpKind.Not, [stall[group]])]),
                 enable=Op(OpKind.Not, [stall[next]])
             ))
             for instr, resource in regs[next].items():
@@ -944,7 +1078,7 @@ if __name__ == "__main__":
         )
         reg_file.write(rd_res, index = rd, enable = is_running & rd_valid & (rd != 0))
 
-        state.write(next_state)
+        #state.write(next_state)
 
         builder.then(builder.commit())
 
