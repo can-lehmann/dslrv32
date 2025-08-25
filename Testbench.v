@@ -10,7 +10,7 @@ module Testbench;
     begin
       $dumpfile("waveform.fst");
       $dumpvars(0, Testbench);
-      #100
+      #1000
       $finish;
     end
 endmodule

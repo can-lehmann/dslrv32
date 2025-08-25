@@ -33,6 +33,21 @@ class Const(Value):
     def format_arg(self):
         return f"{self.width}'d{self.value}"
 
+class Wire(Value):
+    def __init__(self, value):
+        super().__init__(value.width)
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        assert value.width == self.width
+        self.value = value
+
+    def format_arg(self):
+        return f"wire({self.value.format_arg()})"
+
 class Instr(Value):
     def __init__(self, width, args):
         super().__init__(width)
@@ -129,7 +144,11 @@ class Repeat(Instr):
         return [f"count={self.count}"]
 
 class Read(Instr):
-    def __init__(self, resource, index, enable):
+    def __init__(self, resource, index=None, enable=None):
+        if index is None:
+            index = Const(1, 0)
+        if enable is None:
+            enable = Const(1, 1)
         super().__init__(resource.width, [index, enable])
         self.resource = resource
 
@@ -137,12 +156,22 @@ class Read(Instr):
         return [f"resource={self.resource.name}"]
 
 class BaseWrite(Instr):
-    def __init__(self, resource, value, index, enable):
+    def __init__(self, resource, value, index=None, enable=None):
+        if index is None:
+            index = Const(1, 0)
+        if enable is None:
+            enable = Const(1, 1)
         super().__init__(0, [value, index, enable])
         self.resource = resource
 
     def format_parameters(self):
         return [f"resource={self.resource.name}"]
+
+    def get_enable(self):
+        return self.args[2]
+
+    def set_enable(self, enable):
+        self.args[2] = enable
 
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
@@ -198,8 +227,10 @@ class Resource:
         self.initial = {}
 
 class RegisterResource(Resource):
-    def __init__(self, name, width):
+    def __init__(self, name, width, initial = None):
         super().__init__(name, width)
+        if initial is not None:
+            self.initial[0] = initial
 
 class MemoryResource(Resource):
     def __init__(self, name, width, size, read_delay=1, write_delay=1):
@@ -226,7 +257,7 @@ class Processor:
         id = 0
         for group in self.groups:
             for instr in group.instrs:
-                if len(instr.name) == 0:
+                if len(instr.name) == 0 or instr.name.isdigit():
                     instr.name = str(id)
                     id += 1
 
@@ -553,6 +584,143 @@ def group_graph_to_dot(processor):
     res += "}\n"
     return res
 
+def analyze_lifetimes(processor):
+    live = {}
+    for group in processor.groups[::-1]:
+        current_live = set()
+        for next in group.terminator.collect_groups():
+            current_live = current_live.union(live[next])
+        for instr in group.instrs[::-1]:
+            if instr in current_live:
+                current_live.remove(instr)
+            for arg in instr.args:
+                if isinstance(arg, Instr):
+                    current_live.add(arg)
+        live[group] = current_live
+    return live
+
+def strip_wires(value):
+    while isinstance(value, Wire):
+        value = value.get()
+    return value
+
+def toposort(instrs):
+    stack = []
+    for instr in instrs:
+        stack.append((False, instr))
+    order = []
+    started = set()
+    closed = set()
+    while len(stack) > 0:
+        emit, instr = stack.pop()
+        if emit:
+            order.append(instr)
+            assert instr in started
+            assert instr not in closed
+            closed.add(instr)
+        elif instr not in closed:
+            assert instr not in started # Cycle Detection
+            started.add(instr)
+            stack.append((True, instr))
+            instr.args = [strip_wires(arg) for arg in instr.args]
+            for arg in instr.args:
+                if isinstance(arg, Instr) and instr not in closed:
+                    stack.append((False, arg))
+    return order
+
+def find_dominators(processor):
+    dominators = {processor.groups[0]: {processor.groups[0]}}
+    for group in processor.groups:
+        if group not in dominators:
+            continue # Unreachable
+        for next in group.terminator.collect_groups():
+            doms = set(dominators[group])
+            doms.add(next)
+            if next in dominators:
+                dominators[next] = dominators[next].intersect(doms)
+            else:
+                dominators[next] = doms
+    return dominators
+
+def build_stall_tree(terminator, stall):
+    match terminator:
+        case CommitTerminator():
+            return Const(1, 0)
+        case AlwaysTerminator(group=group):
+            return stall[group]
+
+def lower_pipeline(processor):
+    lifetimes = analyze_lifetimes(processor)
+    dominators = find_dominators(processor)
+    regs = {
+        group: {
+            instr: processor.add_resource(RegisterResource(
+                group.name + "_" + instr.name,
+                instr.width
+            ))
+            for instr in live
+        }
+        for group, live in lifetimes.items()
+    }
+    valid = {}
+    stall = {}
+    for group in processor.groups:
+        valid[group] = processor.add_resource(RegisterResource(
+            group.name + "_valid", 1, initial=0
+        ))
+        stall[group] = Wire(Const(1, 0))
+
+    # Pipeline entry is always valid
+    valid[processor.groups[0]].initial[0] = 1
+
+    for group in processor.groups:
+        stall[group].set(Op(OpKind.And, [
+            build_stall_tree(group.terminator, stall),
+            Read(valid[group])
+        ]))
+
+    side_effects = set()
+
+    for group in processor.groups:
+        for instr in group.instrs:
+            if instr.width == 0:
+                side_effects.add(instr)
+
+    for group in processor.groups:
+        substs = {instr: Read(resource) for instr, resource in regs[group].items()}
+        for instr in group.instrs:
+            instr.args = [substs[arg] if arg in substs else arg for arg in instr.args]
+        for next in group.terminator.collect_groups(): # TODO
+            side_effects.add(Write(
+                valid[next],
+                Read(valid[group]),
+                enable=Op(OpKind.Not, [stall[next]])
+            ))
+            for instr, resource in regs[next].items():
+                if instr in substs:
+                    instr = substs[instr]
+                side_effects.add(Write(
+                    resource,
+                    instr,
+                    enable=Op(OpKind.Not, [stall[next]])
+                ))
+
+    for group in processor.groups:
+        enable = Op(OpKind.And, [
+            Read(valid[group]),
+            Op(OpKind.Not, [stall[group]])
+        ])
+        for instr in group.instrs:
+            # TODO: Read
+            if isinstance(instr, BaseWrite):
+                instr.set_enable(Op(OpKind.And, [enable, instr.get_enable()]))
+
+    group = Group()
+    group.name = "pipeline"
+    group.instrs = toposort(side_effects)
+    group.terminator = CommitTerminator()
+    processor.groups = [group]
+
 if __name__ == "__main__":
     from parse_opcodes import InstEncoding
     from elftools.elf.elffile import ELFFile
@@ -565,12 +733,14 @@ if __name__ == "__main__":
     STATE_EBREAK = builder.const(3, 1)
 
     pc = builder.resource(RegisterResource("pc", 32))
+    cycle = builder.resource(RegisterResource("cycle", 32))
     state = builder.resource(RegisterResource("state", 3))
     reg_file = builder.resource(MemoryResource("reg_file", 32, size = 32, read_delay = 0))
     inst_mem = builder.resource(MemoryResource("inst_mem", 8, size = 1 << 24, read_delay = 0))
     data_mem = builder.resource(MemoryResource("data_mem", 8, size = 1 << 24, read_delay = 0))
 
     reg_file.init(0, index=0)
+    cycle.init(0)
     state.init(STATE_RUNNING)
 
     with open("rv32i_test", "rb") as f:
@@ -594,10 +764,10 @@ if __name__ == "__main__":
     groups = builder.groups("fetch", "decode", "execute", "memory", "writeback")
 
     with groups["fetch"]:
-        state_value = state.read()
-        is_running = state_value == STATE_RUNNING
+        state_value = state.read().name("state_value")
+        is_running = (state_value == STATE_RUNNING).name("is_running")
 
-        pc_value = pc.read()
+        pc_value = pc.read().name("pc_value")
         inst = builder.concat(
             inst_mem.read(pc_value + 3),
             inst_mem.read(pc_value + 2),
@@ -606,6 +776,8 @@ if __name__ == "__main__":
         ).name("inst")
 
         pc.predict(pc_value + 4)
+
+        cycle.write(cycle.read() + 1)
 
         builder.then(groups["decode"])
 
@@ -633,9 +805,9 @@ if __name__ == "__main__":
             if "imm12hi" in enc.args:
                 is_simm12 |= matches
 
-        rs1 = inst[15:20]
-        rs2 = inst[20:25]
-        rd = inst[7:12]
+        rs1 = inst[15:20].name("rs1")
+        rs2 = inst[20:25].name("rs2")
+        rd = inst[7:12].name("rd")
 
         imm20 = builder.concat(inst[12:32], builder.const(12, 0))
         jimm20 = builder.concat(
@@ -780,6 +952,11 @@ if __name__ == "__main__":
         f.write(group_graph_to_dot(processor))
 
     print(processor.format(0))
+    print({group.name: {instr.name for instr in live} for group, live in analyze_lifetimes(processor).items()})
+
+    lower_pipeline(processor)
+    print(processor.format(0))
 
     with open(f"{processor.name}.v", "w") as f:
         f.write(generate_verilog(processor))
+
