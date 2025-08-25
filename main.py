@@ -147,9 +147,36 @@ class BaseWrite(Instr):
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
 
+class Terminator:
+    def __init__(self):
+        pass
+
+    def collect_groups(self):
+        return set()
+
+class CommitTerminator(Terminator):
+    def __init__(self):
+        super().__init__()
+
+    def format(self):
+        return "commit"
+
+class AlwaysTerminator(Terminator):
+    def __init__(self, group):
+        super().__init__()
+        self.group = group
+
+    def collect_groups(self):
+        return {self.group}
+
+    def format(self):
+        return self.group.name
+
 class Group:
     def __init__(self):
+        self.incoming = set()
         self.instrs = []
+        self.terminator = None
         self.name = ""
 
     def add(self, instr):
@@ -160,6 +187,8 @@ class Group:
         res = ind(indent) + f"{self.name}:\n"
         for instr in self.instrs:
             res += instr.format(indent + 1)
+        if self.terminator is not None:
+            res += ind(indent + 1) + "then " + self.terminator.format() + "\n"
         return res
 
 class Resource:
@@ -201,6 +230,14 @@ class Processor:
                     instr.name = str(id)
                     id += 1
 
+    def fix_incoming(self):
+        for group in self.groups:
+            group.incoming = set()
+        for group in self.groups:
+            if group.terminator is not None:
+                for next in group.terminator.collect_groups():
+                    next.incoming.add(group)
+
     def format(self, indent):
         self.autoname()
         res = ind(indent) + f"{self.name} {{\n"
@@ -221,6 +258,21 @@ class Builder:
         group.name = name
         self.processor.add_group(group)
         return GroupBuilder(self, group)
+
+    def groups(self, *names):
+        groups = {}
+        for name in names:
+            groups[name] = self.group(name)
+        return groups
+
+    def then(self, terminator):
+        if isinstance(terminator, GroupBuilder):
+            terminator = AlwaysTerminator(terminator.group)
+        assert self.current_group.terminator is None
+        self.current_group.terminator = terminator
+
+    def commit(self):
+        return CommitTerminator()
 
     def resource(self, resource):
         self.processor.add_resource(resource)
@@ -490,6 +542,17 @@ def generate_verilog(processor):
     ports = ", ".join(ports)
     return f"module {processor.name}({ports});\n{body}\nendmodule"
 
+def group_graph_to_dot(processor):
+    res = "digraph {\n"
+    for group in processor.groups:
+        res += f"{group.name} [label=\"{group.name}\", shape=box];\n"
+    for group in processor.groups:
+        if group.terminator is not None:
+            for next in group.terminator.collect_groups():
+                res += f"{group.name} -> {next.name};\n"
+    res += "}\n"
+    return res
+
 if __name__ == "__main__":
     from parse_opcodes import InstEncoding
     from elftools.elf.elffile import ELFFile
@@ -528,7 +591,9 @@ if __name__ == "__main__":
                 mem.init(byte, index = addr)
                 addr += 1
 
-    with builder.group("fetch"):
+    groups = builder.groups("fetch", "decode", "execute", "memory", "writeback")
+
+    with groups["fetch"]:
         state_value = state.read()
         is_running = state_value == STATE_RUNNING
 
@@ -542,7 +607,9 @@ if __name__ == "__main__":
 
         pc.predict(pc_value + 4)
 
-    with builder.group("decode"):
+        builder.then(groups["decode"])
+
+    with groups["decode"]:
         is_inst = {}
         is_imm20 = builder.const(1, 0)
         is_jimm20 = builder.const(1, 0)
@@ -601,7 +668,9 @@ if __name__ == "__main__":
         r1 = reg_file.read(rs1).name("r1")
         r2 = reg_file.read(rs2).name("r2")
 
-    with builder.group("execute"):
+        builder.then(groups["execute"])
+
+    with groups["execute"]:
         rhs = has_imm.mux(imm, r2)
         alu_valid, alu_res = builder.cond(
             (is_inst["add"]  | is_inst["addi"],  1, r1 + rhs),
@@ -651,7 +720,9 @@ if __name__ == "__main__":
         next_pc = branch.mux(branch_target, pc_value + 4)
         pc.write(next_pc, enable = is_running)
 
-    with builder.group("memory"):
+        builder.then(groups["memory"])
+
+    with groups["memory"]:
         addr = r1 + imm
 
         # For now we just assume that we have unlimited read/write ports, this is
@@ -691,7 +762,9 @@ if __name__ == "__main__":
         data_mem.write(r2[8:16], index = addr, enable = is_running & write_mask[1])
         data_mem.write(r2[0:8], index = addr, enable = is_running & write_mask[0])
 
-    with builder.group("writeback"):
+        builder.then(groups["writeback"])
+
+    with groups["writeback"]:
         rd_valid, rd_res = builder.cond(
             (alu_valid, 1, alu_res),
             (mem_valid, 1, mem_res),
@@ -700,6 +773,11 @@ if __name__ == "__main__":
         reg_file.write(rd_res, index = rd, enable = is_running & rd_valid & (rd != 0))
 
         state.write(next_state)
+
+        builder.then(builder.commit())
+
+    with open(f"{processor.name}.gv", "w") as f:
+        f.write(group_graph_to_dot(processor))
 
     print(processor.format(0))
 

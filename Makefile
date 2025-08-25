@@ -17,3 +17,5 @@ Testbench.vvp: Testbench.v Processor.v
 waveform.fst: Testbench.vvp
 	vvp $< -fst
 
+%.svg: %.gv
+	dot -Tsvg -o $@ $<

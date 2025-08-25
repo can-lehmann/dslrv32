@@ -5,3 +5,6 @@ __pycache__/
 Processor.v
 rv32i_*
 !rv32i_*.c
+*.svg
+*.png
+*.gv
