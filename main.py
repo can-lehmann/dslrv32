@@ -23,6 +23,9 @@ class Value:
         self.width = width
         self.name = ""
 
+    def is_autonamed(self):
+        return len(self.name) == 0 or self.name.isdigit()
+
     def format_arg(self):
         return f"%{self.name}"
 
@@ -182,9 +185,13 @@ class BaseWrite(Instr):
 
     def get_index(self):
         return self.args[1]
+    
+    def get_value(self):
+        return self.args[0]
 
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
+class Forward(BaseWrite): pass
 
 class Terminator:
     def __init__(self):
@@ -238,6 +245,9 @@ class Resource:
         self.name = name
         self.width = width
         self.initial = {}
+    
+    def __repr__(self):
+        return f"Resource({self.name}, {self.width})"
 
 class RegisterResource(Resource):
     def __init__(self, name, width, initial = None):
@@ -270,7 +280,7 @@ class Processor:
         id = 0
         for group in self.groups:
             for instr in group.instrs:
-                if len(instr.name) == 0 or instr.name.isdigit():
+                if instr.is_autonamed():
                     instr.name = str(id)
                     id += 1
 
@@ -490,6 +500,10 @@ class ResourceBuilder:
         index, enable = self.create_index_enable(index, enable)
         self.builder.emit(Predict(self.resource, value.value, index.value, enable.value))
 
+    def forward(self, value, index=None, enable=None):
+        index, enable = self.create_index_enable(index, enable)
+        self.builder.emit(Forward(self.resource, value.value, index.value, enable.value))
+
 def generate_verilog(processor):
     ports = ["input clock"]
     body = ""
@@ -538,6 +552,7 @@ def generate_verilog(processor):
                                 body += f"always @(posedge clock) {name} <= {expr};\n"
                                 expr = name
                 case Predict(): pass
+                case Forward(): pass
                 case Write(resource=resource):
                     match resource:
                         case RegisterResource(name=name):
@@ -598,6 +613,7 @@ def group_graph_to_dot(processor):
     return res
 
 def analyze_lifetimes(processor):
+    """Returns a mapping from groups to the set of live values at the beginning of the group."""
     live = {}
     for group in processor.groups[::-1]:
         current_live = set()
@@ -610,14 +626,22 @@ def analyze_lifetimes(processor):
                 if isinstance(arg, Instr):
                     current_live.add(arg)
         live[group] = current_live
+    assert len(live[processor.groups[0]]) == 0
     return live
 
-def strip_wires(value):
-    while isinstance(value, Wire):
-        value = value.get()
-    return value
-
 def toposort(instrs):
+    """Flatten the given instruction graph into a topological order."""
+
+    def strip_wires(value):
+        name = None
+        while isinstance(value, Wire):
+            if not value.is_autonamed():
+                name = value.name
+            value = value.get()
+        if name is not None and value.is_autonamed():
+            value.name = name
+        return value
+
     stack = []
     for instr in instrs:
         stack.append((False, instr))
@@ -642,6 +666,7 @@ def toposort(instrs):
     return order
 
 def find_dominators(processor):
+    """Returns a mapping from groups to the set of groups that dominate them."""
     dominators = {processor.groups[0]: {processor.groups[0]}}
     for group in processor.groups:
         if group not in dominators:
@@ -653,6 +678,10 @@ def find_dominators(processor):
                 dominators[next] = dominators[next].intersect(doms)
             else:
                 dominators[next] = doms
+    assert all(
+        group in doms and processor.groups[0] in doms
+        for group, doms in dominators.items()
+    )
     return dominators
 
 def build_stall_tree(terminator, stall):
@@ -662,7 +691,7 @@ def build_stall_tree(terminator, stall):
         case AlwaysTerminator(group=group):
             return stall[group]
 
-def create_id(processor):
+def create_id(processor, lifetimes):
     """Each execution is given an identifier for the purpose of ordering."""
     id_reg = processor.add_resource(RegisterResource(
         "id_reg",
@@ -673,6 +702,11 @@ def create_id(processor):
     id.name = "id"
     next_id = Op(OpKind.Add, [id, Const(id.width, 1)])
     processor.groups[0].add_all(id, next_id, Write(id_reg, next_id))
+
+    # We need to ID to be live everywhere
+    for group, live in lifetimes.items():
+        if group != processor.groups[0]:
+            live.add(id)
 
     return id
 
@@ -694,6 +728,11 @@ class Access:
         return None
 
 def find_accesses(processor):
+    """
+    Returns a mapping from groups to a mapping from instructions to their accesses.
+    For each group, it includes all accesses which may occur in that group or any
+    of its (indirect) successors.
+    """
     accesses = {}
     for group in processor.groups[::-1]:
         accesses[group] = {}
@@ -707,15 +746,53 @@ def find_accesses(processor):
                 accesses[group][instr] = access
     return accesses
 
+def find_indirect_successors(processor):
+    succs = {}
+    for group in processor.groups[::-1]:
+        succs[group] = {group}
+        for next in group.terminator.collect_groups():
+            succs[group] = succs[group].union(succs[next])
+    return succs
+
+def find_forwards(processor, indirect_successors):
+    forwards = {
+        group: {
+            resource: {from_group: set() for from_group in processor.groups}
+            for resource in processor.resources
+        }
+        for group in processor.groups
+    }
+    for group in processor.groups:
+        for instr in group.instrs:
+            if isinstance(instr, Forward):
+                for succ in indirect_successors[group]:
+                    forwards[succ][instr.resource][group].add(instr)
+    return forwards
+
+def stretch_lifetimes(processor, lifetimes, forwards):
+    """Forwarded values need to be live in all indirect successors."""
+    for group in processor.groups:
+        for resource, from_groups in forwards[group].items():
+            for from_group, instrs in from_groups.items():
+                if from_group != group:
+                    for forward in instrs:
+                        lifetimes[group].add(forward.get_index())
+                        lifetimes[group].add(forward.get_value())
+                        lifetimes[group].add(forward.get_enable())
+    return lifetimes
+
 def lower_pipeline(processor):
     lifetimes = analyze_lifetimes(processor)
     dominators = find_dominators(processor)
     accesses = find_accesses(processor)
-    id = create_id(processor)
-    for group, live in lifetimes.items():
-        # We need to ID to be live everywhere
-        if group != processor.groups[0]:
-            live.add(id)
+
+    # Create ID
+    id = create_id(processor, lifetimes)
+
+    # Forwards
+    indirect_successors = find_indirect_successors(processor)
+    forwards = find_forwards(processor, indirect_successors)
+    lifetimes = stretch_lifetimes(processor, lifetimes, forwards)
 
     regs = {
         group: {
@@ -734,6 +811,7 @@ def lower_pipeline(processor):
             group.name + "_valid", 1, initial=0
         ))
         stall[group] = Wire(Const(1, 0))
+        stall[group].name = group.name + "_stall"
 
     # Pipeline entry is always valid
     valid[processor.groups[0]].initial[0] = 1
@@ -791,9 +869,14 @@ def lower_pipeline(processor):
             # If group dominates other -> other.id <_commit group.id
             if group not in dominators[other]:
                 assert False # Not implemented
+            
             any_conflict = Const(1, 0)
-            for other_instr, other_access in accesses[other].items():
-                for instr in group.instrs:
+
+            # Writes from groups with an earlier id may conflict
+            for instr in group.instrs:
+                any_conflict_for_instr = Const(1, 0)
+
+                for other_instr, other_access in accesses[other].items():
                     access = Access.from_instr(instr)
                     if access is not None and \
                        (access.is_write or other_access.is_write) and \
@@ -813,7 +896,34 @@ def lower_pipeline(processor):
                                     access.index
                                 ])
                             ])
-                        any_conflict = Op(OpKind.Or, [any_conflict, conflict])
+                        any_conflict_for_instr = Op(OpKind.Or, [any_conflict_for_instr, conflict])
+            
+                if isinstance(instr, Read):
+                    # However, if there is a forward for the exact index, there is no conflict
+                    # TODO: It has to be the latest forward for this index
+                    for from_group, instrs in forwards[other][instr.resource].items():
+                        for forward in instrs:
+                            index, enable, value = forward.get_index(), forward.get_enable(), forward.get_value()
+                            if from_group != other:
+                                index = value_in_group(index, other)
+                                enable = value_in_group(enable, other)
+                                value = value_in_group(value, other)
+                            if index is not None and enable is not None and value is not None:
+                                can_forward = Op(OpKind.And, [
+                                    can_conflict, # Makes debugging nicer
+                                    Op(OpKind.And, [
+                                        Op(OpKind.Eq, [index, access.index]),
+                                        enable
+                                    ])
+                                ])
+                                can_forward.name = f"can_forward_{instr.name}_for_{instr.resource.name}_from_{other.name}_to_{group.name}"
+                                any_conflict_for_instr = Op(OpKind.And, [
+                                    any_conflict_for_instr,
+                                    Op(OpKind.Not, [can_forward])
+                                ])
+
+                any_conflict = Op(OpKind.Or, [any_conflict, any_conflict_for_instr])
+            
             conflict = Op(OpKind.And, [can_conflict, any_conflict])
             stall[group].set(Op(OpKind.Or, [
                 conflict,
@@ -974,6 +1084,17 @@ if __name__ == "__main__":
         r1 = reg_file.read(rs1).name("r1")
         r2 = reg_file.read(rs2).name("r2")
 
+        is_branch = is_inst["jal"] | \
+                    is_inst["jalr"] | \
+                    is_inst["ebreak"] | \
+                    is_inst["beq"] | \
+                    is_inst["bne"] | \
+                    is_inst["blt"] | \
+                    is_inst["bge"] | \
+                    is_inst["bltu"] | \
+                    is_inst["bgeu"]
+        pc.forward(pc_value + 4, enable = is_running & ~is_branch)
+
         builder.then(groups["execute"])
 
     with groups["execute"]:
@@ -1022,6 +1143,9 @@ if __name__ == "__main__":
             (state_value,)
         )
         next_state.name("next_state")
+        state_changed = (next_state != state_value).name("state_changed")
+
+        reg_file.forward(alu_res, index = rd, enable = is_running & alu_valid & (rd != 0))
 
         next_pc = branch.mux(branch_target, pc_value + 4)
         pc.write(next_pc, enable = is_running)
@@ -1078,7 +1202,7 @@ if __name__ == "__main__":
         )
         reg_file.write(rd_res, index = rd, enable = is_running & rd_valid & (rd != 0))
 
-        #state.write(next_state)
+        state.write(next_state, enable=state_changed)
 
         builder.then(builder.commit())
 
