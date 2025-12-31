@@ -12,7 +12,7 @@ Processor.v: main.py rv32i_test
 	python3 main.py
 
 Testbench.vvp: Testbench.v Processor.v
-	iverilog -o $@ $^
+	iverilog -g2005-sv -o $@ $^
 
 waveform.fst: Testbench.vvp
 	vvp $< -fst

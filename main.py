@@ -29,6 +29,9 @@ class Value:
     def format_arg(self):
         return f"%{self.name}"
 
+    def is_const(self, value):
+        return isinstance(self, Const) and self.value == value
+
 class Const(Value):
     def __init__(self, width, value):
         super().__init__(width)
@@ -192,6 +195,11 @@ class BaseWrite(Instr):
 class Write(BaseWrite): pass
 class Predict(BaseWrite): pass
 class Forward(BaseWrite): pass
+
+class UnknownGuard(Instr):
+    def __init__(self, value):
+        super().__init__(0, [value])
+
 
 class Terminator:
     def __init__(self):
@@ -529,15 +537,15 @@ def generate_verilog(processor):
 
     for group in processor.groups:
         for instr in group.instrs:
-            args = []
-            for arg in instr.args:
-                if isinstance(arg, Instr):
-                    args.append("_" + arg.name)
-                elif isinstance(arg, Const):
-                    args.append(arg.format_arg())
+            def value_name(value):
+                if isinstance(value, Instr):
+                    return "_" + value.name
+                elif isinstance(value, Const):
+                    return value.format_arg()
                 else:
                     assert False
 
+            args = [value_name(arg) for arg in instr.args]
             expr = None
             match instr:
                 case Read(resource=resource):
@@ -564,6 +572,34 @@ def generate_verilog(processor):
                             body += f"always @(posedge clock) "
                             body += f"if ({args[2]}) "
                             body += f"{name}[{args[1]}] <= {args[0]};\n"
+                case UnknownGuard():
+                    def is_unknown(value):
+                        return " | ".join([
+                            f"{value_name(value)}[{it}] === 1'bx"
+                            for it in range(value.width)
+                        ])
+                    
+                    def gen_reason(instr, indent = "  "):
+                        nonlocal body
+
+                        code = instr.format(0).replace("%", "%%").replace("\n", "").replace("%", "\\%")
+                        body += f"$display(\"{indent}{code} => \", {value_name(instr)});\n"
+
+                        body += f"if ({is_unknown(instr)}) begin\n"
+                        for arg in instr.args:
+                            if isinstance(arg, Instr):
+                                gen_reason(arg, indent + "  ")
+                        body += indent + "end\n"
+                    
+                    body += f"// Unknown guard for {args[0]}\n"
+                    body += f"always @(posedge clock) "
+                    body += f"if ({is_unknown(instr.args[0])}) begin\n"
+                    body += f"$display(\"Error: {args[0]} is unknown: \", {args[0]});\n"
+                    if isinstance(instr.args[0], Instr):
+                        gen_reason(instr.args[0])
+                    body += "#2;\n"
+                    body += f"$finish;\n"
+                    body += f"end\n"
                 case Op(kind=kind):
                     SIMPLE_BINOPS = {
                         OpKind.Add: "+", OpKind.Sub: "-", OpKind.Mul: "*",
@@ -776,12 +812,41 @@ def stretch_lifetimes(processor, lifetimes, forwards):
             for from_group, instrs in from_groups.items():
                 if from_group != group:
                     for forward in instrs:
-                        lifetimes[group].add(forward.get_index())
-                        lifetimes[group].add(forward.get_value())
-                        lifetimes[group].add(forward.get_enable())
+                        def add(value):
+                            if isinstance(value, Instr):
+                                lifetimes[group].add(value)
+                        
+                        add(forward.get_index())
+                        add(forward.get_value())
+                        add(forward.get_enable())
     return lifetimes
 
+def create_forward_muxes(processor, forward_paths):
+    """
+    Maps Read instructions to multiplexers which select the correct forwarded value.
+    This results in constructs of the form:
+        Mux(cond_0, forward_0, Mux(cond_1, forward_1, ... (forward_n, Read()) ...))
+    """
+    muxes = {}
+    for read, paths in forward_paths.items():
+        result = read
+        for (cond, value) in paths[::-1]:
+            result = Op(OpKind.Mux, [cond, value, result])
+        if not read.is_autonamed():
+            result.name = read.name
+            read.name = ""
+        muxes[read] = result
+    return muxes
+
+def find_parents(processor):
+    parents = {}
+    for group in processor.groups:
+        for instr in group.instrs:
+            parents[instr] = group
+    return parents
+
 def lower_pipeline(processor):
+    parents = find_parents(processor)
     lifetimes = analyze_lifetimes(processor)
     dominators = find_dominators(processor)
     accesses = find_accesses(processor)
@@ -794,16 +859,19 @@ def lower_pipeline(processor):
     forwards = find_forwards(processor, indirect_successors)
     lifetimes = stretch_lifetimes(processor, lifetimes, forwards)
 
-    regs = {
-        group: {
-            instr: processor.add_resource(RegisterResource(
+    processor.autoname()
+
+    regs = {}
+    for group, live in lifetimes.items():
+        regs[group] = {}
+        for instr in live:
+            assert isinstance(instr, Instr)
+            assert len(instr.name) > 0
+            regs[group][instr] = processor.add_resource(RegisterResource(
                 group.name + "_" + instr.name,
                 instr.width
             ))
-            for instr in live
-        }
-        for group, live in lifetimes.items()
-    }
+
     valid = {}
     stall = {}
     for group in processor.groups:
@@ -830,10 +898,13 @@ def lower_pipeline(processor):
                 side_effects.add(instr)
 
     def value_in_group(value, group):
+        assert not isinstance(value, Wire)
         if isinstance(value, Const):
             return value
         elif value in regs[group]:
             return Read(regs[group][value])
+        elif isinstance(value, Instr) and parents[value] == group:
+            return value
         elif isinstance(value, Op) and value.width == 1:
             args = []
             for arg in value.args:
@@ -842,7 +913,8 @@ def lower_pipeline(processor):
                     return None
                 args.append(arg)
             return Op(value.kind, args)
-        return None
+        else:
+            return None
 
     def access_in_group(access, group):
         return Access(
@@ -851,6 +923,10 @@ def lower_pipeline(processor):
             value_in_group(access.index, group),
             value_in_group(access.enable, group)
         )
+
+    # Maps Read instructions to a list of possible forwarding path. Each path is a tuple
+    # of the form (condition, value). This is filled out during conflict analysis.
+    forward_paths = {}
 
     for group in processor.groups:
         for other in processor.groups:
@@ -903,37 +979,53 @@ def lower_pipeline(processor):
                     # TODO: It has to be the latest forward for this index
                     for from_group, instrs in forwards[other][instr.resource].items():
                         for forward in instrs:
-                            index, enable, value = forward.get_index(), forward.get_enable(), forward.get_value()
-                            if from_group != other:
-                                index = value_in_group(index, other)
-                                enable = value_in_group(enable, other)
-                                value = value_in_group(value, other)
-                            if index is not None and enable is not None and value is not None:
-                                can_forward = Op(OpKind.And, [
-                                    can_conflict, # Makes debugging nicer
-                                    Op(OpKind.And, [
-                                        Op(OpKind.Eq, [index, access.index]),
-                                        enable
-                                    ])
-                                ])
-                                can_forward.name = f"can_forward_{instr.name}_for_{instr.resource.name}_from_{other.name}_to_{group.name}"
-                                any_conflict_for_instr = Op(OpKind.And, [
-                                    any_conflict_for_instr,
-                                    Op(OpKind.Not, [can_forward])
-                                ])
+                            index = value_in_group(forward.get_index(), other)
+                            enable = value_in_group(forward.get_enable(), other)
+                            value = value_in_group(forward.get_value(), other)
 
-                any_conflict = Op(OpKind.Or, [any_conflict, any_conflict_for_instr])
+                            if index is None or enable is None or value is None:
+                                continue
+
+                            can_forward = Op(OpKind.And, [
+                                can_conflict, # can_forward is also used for the forwarding muxes, so we need to include can_conflict here
+                                Op(OpKind.And, [
+                                    Op(OpKind.Eq, [index, instr.get_index()]),
+                                    enable
+                                ])
+                            ])
+                            can_forward.name = f"can_forward_{instr.name}_for_{instr.resource.name}_from_{other.name}_to_{group.name}"
+                            any_conflict_for_instr = Op(OpKind.And, [
+                                any_conflict_for_instr,
+                                Op(OpKind.Not, [can_forward])
+                            ])
+
+                            if instr not in forward_paths:
+                                forward_paths[instr] = []
+                            forward_paths[instr].append((can_forward, value))
+
+                any_conflict_for_instr.name = f"any_conflict_for_instr_{instr.name}_from_{other.name}_to_{group.name}"
+
+                if not any_conflict_for_instr.is_const(0): # Some basic simplification in order to prevent generating too many instructions
+                    any_conflict = Op(OpKind.Or, [any_conflict, any_conflict_for_instr])
             
-            conflict = Op(OpKind.And, [can_conflict, any_conflict])
+            can_conflict = Op(OpKind.And, [can_conflict, any_conflict])
+            
             stall[group].set(Op(OpKind.Or, [
-                conflict,
+                can_conflict,
                 stall[group].get()
             ]))
 
+    forward_muxes = create_forward_muxes(processor, forward_paths)
+    print(forward_muxes)
+
     for group in processor.groups:
         substs = {instr: Read(resource) for instr, resource in regs[group].items()}
+
         for instr in group.instrs:
             instr.args = [substs[arg] if arg in substs else arg for arg in instr.args]
+            if instr in forward_muxes:
+                substs[instr] = forward_muxes[instr]
+        
         for next in group.terminator.collect_groups(): # TODO
             side_effects.add(Write(
                 valid[next],
@@ -958,6 +1050,9 @@ def lower_pipeline(processor):
             # TODO: Read
             if isinstance(instr, BaseWrite):
                 instr.set_enable(Op(OpKind.And, [enable, instr.get_enable()]))
+
+    for group, wire in stall.items():
+        side_effects.add(UnknownGuard(wire.get()))
 
     group = Group()
     group.name = "pipeline"
@@ -1095,6 +1190,14 @@ if __name__ == "__main__":
                     is_inst["bgeu"]
         pc.forward(pc_value + 4, enable = is_running & ~is_branch)
 
+        next_state, = builder.cond(
+            (is_running & is_inst["ebreak"], STATE_EBREAK),
+            (state_value,)
+        )
+        next_state.name("next_state")
+        state_changed = (next_state != state_value).name("state_changed")
+        state.forward(state_value, enable = ~state_changed)
+
         builder.then(groups["execute"])
 
     with groups["execute"]:
@@ -1137,13 +1240,6 @@ if __name__ == "__main__":
             (is_inst["bgeu"],   ~r1.lt_u(r2)),
             (0,)
         )
-
-        next_state, = builder.cond(
-            (is_running & is_inst["ebreak"], STATE_EBREAK),
-            (state_value,)
-        )
-        next_state.name("next_state")
-        state_changed = (next_state != state_value).name("state_changed")
 
         reg_file.forward(alu_res, index = rd, enable = is_running & alu_valid & (rd != 0))
 
