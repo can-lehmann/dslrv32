@@ -30,6 +30,7 @@ with execute_group:
 
     ...
 
+    # We can already forward the result here if it is an ALU operation
     reg_file.forward(alu_res, index = rd, enable = alu_valid)
 
     builder.then(writeback_group())
@@ -41,6 +42,7 @@ with writeback_group:
         (0, )
     )
 
+    # Write back to the register file
     reg_file.write(result, index=rd, enable = alu_valid | mem_read)
 
     builder.then(builder.commit())
