@@ -40,6 +40,11 @@ class Const(Value):
     def format_arg(self):
         return f"{self.width}'d{self.value}"
 
+class Arg(Value):
+    def __init__(self, name, width):
+        super().__init__(width)
+        self.name = name
+
 class Wire(Value):
     def __init__(self, value):
         super().__init__(value.width)
@@ -208,27 +213,62 @@ class Terminator:
     def collect_groups(self):
         return set()
 
+    def collect_always(self):
+        return set()
+
 class CommitTerminator(Terminator):
     def __init__(self):
         super().__init__()
 
-    def format(self):
+    def format(self, indent):
         return "commit"
 
 class AlwaysTerminator(Terminator):
-    def __init__(self, group):
+    def __init__(self, group, args):
         super().__init__()
         self.group = group
+        self.args = args
 
     def collect_groups(self):
         return {self.group}
 
-    def format(self):
-        return self.group.name
+    def format(self, indent):
+        args = ", ".join([arg.format_arg() for arg in self.args])
+        return f"{self.group.name}({args})"
+
+    def collect_always(self):
+        return {self}
+
+class BranchTerminator(Terminator):
+    def __init__(self, cond, true, false):
+        super().__init__()
+        self.cond = cond
+        self.true = true
+        self.false = false
+
+    def collect_groups(self):
+        return self.true.collect_groups().union(self.false.collect_groups())
+
+    def format(self, indent):
+        text = "branch\n"
+        current = self
+        while isinstance(current, BranchTerminator):
+            text += ind(indent + 1)
+            text += current.cond.format_arg()
+            text += " -> "
+            text += self.true.format(indent + 2)
+            text += "\n"
+            current = current.false
+        text += ind(indent + 1) + "else -> " + current.format(indent + 2)
+        return text
+
+    def collect_always(self):
+        return self.true.collect_always().union(self.false.collect_always())
 
 class Group:
     def __init__(self):
         self.incoming = set()
+        self.args = []
         self.instrs = []
         self.terminator = None
         self.name = ""
@@ -241,11 +281,15 @@ class Group:
         self.instrs += instrs
 
     def format(self, indent):
-        res = ind(indent) + f"{self.name}:\n"
+        args = ", ".join([
+            f"{arg.name}: {arg.width}"
+            for arg in self.args
+        ])
+        res = ind(indent) + f"{self.name}({args}):\n"
         for instr in self.instrs:
             res += instr.format(indent + 1)
         if self.terminator is not None:
-            res += ind(indent + 1) + "then " + self.terminator.format() + "\n"
+            res += ind(indent + 1) + "then " + self.terminator.format(indent + 1) + "\n"
         return res
 
 class Resource:
@@ -315,9 +359,11 @@ class Builder:
         self.processor = processor
         self.current_group = None
 
-    def group(self, name):
+    def group(self, name, *args):
         group = Group()
         group.name = name
+        for (arg_name, arg_width) in args:
+            group.args.append(Arg(arg_name, arg_width))
         self.processor.add_group(group)
         return GroupBuilder(self, group)
 
@@ -328,8 +374,7 @@ class Builder:
         return groups
 
     def then(self, terminator):
-        if isinstance(terminator, GroupBuilder):
-            terminator = AlwaysTerminator(terminator.group)
+        assert isinstance(terminator, Terminator)
         assert self.current_group.terminator is None
         self.current_group.terminator = terminator
 
@@ -359,6 +404,9 @@ class Builder:
             res = ValueBuilder.op(OpKind.Concat, res, value)
         return res
 
+    def branch(self, cond, true, false):
+        return BranchTerminator(cond.value, true, false)
+
 class GroupBuilder:
     def __init__(self, builder, group):
         self.builder = builder
@@ -367,15 +415,33 @@ class GroupBuilder:
     def __enter__(self):
         assert self.builder.current_group is None
         self.builder.current_group = self.group
+        return tuple([
+            ValueBuilder(self.builder, arg)
+            for arg in self.group.args
+        ])
 
     def __exit__(self, exc_type, exc_value, trackback):
         self.builder.current_group = None
+    
+    def __call__(self, *args):
+        arg_values = []
+        assert len(args) == len(self.group.args)
+        for formal_arg, arg in zip(self.group.args, args):
+            arg = ValueBuilder.ensure(arg, formal_arg.width, self.builder)
+            arg_values.append(arg.value)
+        return AlwaysTerminator(self.group, arg_values)
 
 class ValueBuilder:
     def __init__(self, builder, value):
         assert isinstance(value, Value)
         self.builder = builder
         self.value = value
+
+    def ensure(value, width, builder):
+        if isinstance(value, ValueBuilder):
+            return value
+        else:
+            return ValueBuilder(builder, Const(width, value))
 
     def name(self, name):
         self.value.name = name
@@ -388,7 +454,7 @@ class ValueBuilder:
         ]
         infer_op_width(kind, widths)
         op = Op(kind, [
-            arg.value if isinstance(arg, ValueBuilder) else Const(width, arg)
+            ValueBuilder.ensure(arg, width, builder).value
             for width, arg in zip(widths, args)
         ])
         builder.emit(op)
@@ -637,14 +703,22 @@ def generate_verilog(processor):
     ports = ", ".join(ports)
     return f"module {processor.name}({ports});\n{body}\nendmodule"
 
-def group_graph_to_dot(processor):
+def group_graph_to_dot(processor, show_args=False):
+    processor.autoname()
     res = "digraph {\n"
     for group in processor.groups:
         res += f"{group.name} [label=\"{group.name}\", shape=box];\n"
     for group in processor.groups:
         if group.terminator is not None:
-            for next in group.terminator.collect_groups():
-                res += f"{group.name} -> {next.name};\n"
+            for terminator in group.terminator.collect_always():
+                assert isinstance(terminator, AlwaysTerminator)
+                label = ""
+                if show_args:
+                    label = "\n".join([
+                        f"{formal_arg.name} = {arg.format_arg()}"
+                        for formal_arg, arg in zip(terminator.group.args, terminator.args)
+                    ])
+                res += f"{group.name} -> {terminator.group.name} [label=\"{label}\"];\n"
     res += "}\n"
     return res
 
@@ -654,7 +728,8 @@ def analyze_lifetimes(processor):
     for group in processor.groups[::-1]:
         current_live = set()
         for next in group.terminator.collect_groups():
-            current_live = current_live.union(live[next])
+            if next in live:
+                current_live = current_live.union(live[next])
         for instr in group.instrs[::-1]:
             if instr in current_live:
                 current_live.remove(instr)
@@ -711,7 +786,7 @@ def find_dominators(processor):
             doms = set(dominators[group])
             doms.add(next)
             if next in dominators:
-                dominators[next] = dominators[next].intersect(doms)
+                dominators[next] = dominators[next].intersection(doms)
             else:
                 dominators[next] = doms
     assert all(
@@ -720,12 +795,29 @@ def find_dominators(processor):
     )
     return dominators
 
-def build_stall_tree(terminator, stall):
+def build_stall_tree(terminator, stall): #, counters, regs, id, from_group):
     match terminator:
         case CommitTerminator():
             return Const(1, 0)
         case AlwaysTerminator(group=group):
-            return stall[group]
+            needs_stall = stall[group]
+            if False and group in counters:
+                needs_stall = Op(OpKind.Or, [
+                    needs_stall,
+                    Op(OpKind.Not, [
+                        Op(OpKind.Eq, [
+                            counters[group],
+                            regs[from_group][id]
+                        ])
+                    ])
+                ])
+            return needs_stall
+        case BranchTerminator(cond=cond, true=true, false=false):
+            return Op(OpKind.Mux, [
+                cond,
+                build_stall_tree(true, stall),
+                build_stall_tree(false, stall)
+            ])
 
 def create_id(processor, lifetimes):
     """Each execution is given an identifier for the purpose of ordering."""
@@ -1100,9 +1192,14 @@ if __name__ == "__main__":
                 mem.init(byte, index = addr)
                 addr += 1
 
-    groups = builder.groups("fetch", "decode", "execute", "memory", "writeback")
+    fetch_group = builder.group("fetch")
+    decode_group = builder.group("decode")
+    execute_group = builder.group("execute")
+    divide_group = builder.group("divide", ("count", 32), ("remainder", 64), ("dividend", 64), ("quotient", 32))
+    memory_group = builder.group("memory")
+    writeback_group = builder.group("writeback", ("rd_valid", 1), ("rd_res", 32))
 
-    with groups["fetch"]:
+    with fetch_group:
         state_value = state.read().name("state_value")
         is_running = (state_value == STATE_RUNNING).name("is_running")
 
@@ -1118,9 +1215,9 @@ if __name__ == "__main__":
 
         cycle.write(cycle.read() + 1)
 
-        builder.then(groups["decode"])
+        builder.then(decode_group())
 
-    with groups["decode"]:
+    with decode_group:
         is_inst = {}
         is_imm20 = builder.const(1, 0)
         is_jimm20 = builder.const(1, 0)
@@ -1188,6 +1285,7 @@ if __name__ == "__main__":
                     is_inst["bge"] | \
                     is_inst["bltu"] | \
                     is_inst["bgeu"]
+
         pc.forward(pc_value + 4, enable = is_running & ~is_branch)
 
         next_state, = builder.cond(
@@ -1198,9 +1296,23 @@ if __name__ == "__main__":
         state_changed = (next_state != state_value).name("state_changed")
         state.forward(state_value, enable = ~state_changed)
 
-        builder.then(groups["execute"])
+        is_divide = is_inst["div"] | is_inst["divu"] | is_inst["rem"] | is_inst["remu"]
+        is_divide.name("is_divide")
 
-    with groups["execute"]:
+        builder.then(
+            builder.branch(
+                is_divide,
+                divide_group(
+                    32,
+                    r1.z_ext(64),
+                    r2.z_ext(64).shl(32),
+                    builder.const(32, 0)
+                ),
+                execute_group()
+            )
+        )
+
+    with execute_group:
         rhs = has_imm.mux(imm, r2)
         alu_valid, alu_res = builder.cond(
             (is_inst["add"]  | is_inst["addi"],  1, r1 + rhs),
@@ -1246,9 +1358,28 @@ if __name__ == "__main__":
         next_pc = branch.mux(branch_target, pc_value + 4)
         pc.write(next_pc, enable = is_running)
 
-        builder.then(groups["memory"])
+        builder.then(memory_group())
 
-    with groups["memory"]:
+    with divide_group as (count, remainder, dividend, quotient):
+        is_less = dividend.lt_u(remainder)
+        next_dividend = is_less.mux(remainder - dividend, remainder)
+        next_quotient = quotient.shl(1) | is_less.mux(1, builder.const(32, 0))
+
+        result, = builder.cond(
+            (is_inst["div"],   quotient),
+            (is_inst["divu"],  quotient),
+            (is_inst["rem"],   remainder[0:32]),
+            (is_inst["remu"],  remainder[0:32]),
+            (builder.const(32, 0), )
+        )
+
+        builder.then(builder.branch(
+            count == 0,
+            writeback_group(1, result),
+            divide_group(count - 1, remainder.shr_u(1), next_dividend, quotient)
+        ))
+
+    with memory_group:
         addr = r1 + imm
 
         # For now we just assume that we have unlimited read/write ports, this is
@@ -1288,14 +1419,15 @@ if __name__ == "__main__":
         data_mem.write(r2[8:16], index = addr, enable = is_running & write_mask[1])
         data_mem.write(r2[0:8], index = addr, enable = is_running & write_mask[0])
 
-        builder.then(groups["writeback"])
-
-    with groups["writeback"]:
-        rd_valid, rd_res = builder.cond(
+        (rd_valid, rd_res) = builder.cond(
             (alu_valid, 1, alu_res),
             (mem_valid, 1, mem_res),
             (builder.const(1, 0), 0)
         )
+
+        builder.then(writeback_group(rd_valid, rd_res))
+
+    with writeback_group as (rd_valid, rd_res):
         reg_file.write(rd_res, index = rd, enable = is_running & rd_valid & (rd != 0))
 
         state.write(next_state, enable=state_changed)
