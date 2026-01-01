@@ -52,6 +52,14 @@ Each pipeline stage is represented by a group.
 Control flow between stages is expressed using `builder.then()`.
 Dependencies between stages are automatically detected and the pipeline is stalled when necessary.
 
+## An Example Processor
+
+Currently the main focus is on developing a RV32IM processor core with a 5-stage pipeline using this DSL.
+It branches after the decode stage and handles division instructions using a separate execution unit.
+Here is a diagram generated from the current implementation:
+
+![Pipeline Diagram](docs/Processor.svg)
+
 ## Related Work
 
 Most closely related is PDL [1], which also automatically handles pipeline conflicts.

@@ -8,3 +8,4 @@ rv32i_*
 *.svg
 *.png
 *.gv
+!docs/*.svg

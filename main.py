@@ -706,6 +706,8 @@ def generate_verilog(processor):
 def group_graph_to_dot(processor, show_args=False):
     processor.autoname()
     res = "digraph {\n"
+    res += f"node [fontname=\"sans-serif\"];\n"
+    res += f"edge [fontname=\"sans-serif\"];\n"
     for group in processor.groups:
         res += f"{group.name} [label=\"{group.name}\", shape=box];\n"
     for group in processor.groups:

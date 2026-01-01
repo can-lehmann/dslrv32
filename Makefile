@@ -19,3 +19,6 @@ waveform.fst: Testbench.vvp
 
 %.svg: %.gv
 	dot -Tsvg -o $@ $<
+
+docs/%.svg: %.svg
+	cp $< $@
